@@ -18,7 +18,7 @@ python bot.py
 ```
 
 Windows (перманентно):
-
+python bot.py
 ```powershell
 setx TELEGRAM_BOT_TOKEN "123:ABC"
 ```
@@ -37,4 +37,4 @@ python bot.py
 
 ## Примечания
 
-- База SQLite по умолчанию: `recipes.db` (не коммитится в GitHub).
+- База SQLite по умолчанию: `recipes.db` (не коммитится в GitHub

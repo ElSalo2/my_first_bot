@@ -9,10 +9,17 @@ from urllib.parse import quote
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+from food_emojis import emoji_for_dish, emoji_for_ingredient
+from ingredient_synonyms import (
+    canonical_ingredient_display,
+    ingredient_merge_key,
+    shopping_lines_from_buckets,
+)
 
 # `transliterate` используется только для авто-преобразования латиницы в кириллицу.
 # Если библиотека не установлена — бот продолжит работать, просто вернув исходную строку.
@@ -47,6 +54,15 @@ def _load_token_from_dotenv(path: str = ".env") -> str | None:
 
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or _load_token_from_dotenv()
+
+START_HELP_TEXT = (
+    "Привет! 👋 Я помогу проверить ингредиенты для блюда.\n\n"
+    "Что умею:\n"
+    "• /recipes — показать список блюд 📋\n"
+    "• /add_recipe — добавить новое блюдо (только админ) 🧑‍🍳\n"
+    "• /cancel — выйти из текущего диалога ❌\n\n"
+    "Просто напиши название блюда, и я запущу мини-квиз по ингредиентам 😉"
+)
 
 # Telegram ID администратора: только он может добавлять блюда.
 ADMIN_ID = 69026978
@@ -121,25 +137,38 @@ def normalize_recipe_name(name: str) -> str:
     return normalized
 
 
+def format_dish_title(name: str) -> str:
+    """Название блюда с эмодзи без кавычек."""
+    return f"{emoji_for_dish(name)} {name}"
+
+
+def format_ingredient_display(name: str) -> str:
+    """Строка ингредиента с подходящим эмодзи."""
+    return f"{emoji_for_ingredient(name)} {name}"
+
+
 def build_magnit_search_url(product_name: str) -> str:
     """Формирует ссылку на поиск товара в Магните (magnit.ru)."""
     return f"https://magnit.ru/search?term={quote(product_name)}"
 
 
-def unique_sorted_casefold(items: list[str]) -> list[str]:
-    """
-    Удаляет дубликаты и сортирует по алфавиту без учёта регистра (Unicode).
-    При дубликатах сохраняет первое встреченное написание.
-    """
-    seen: dict[str, str] = {}
-    for item in items:
-        cleaned = (item or "").strip()
-        if not cleaned:
+def _coerce_extras_list(raw: object) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    return [str(x).strip() for x in raw if str(x).strip()]
+
+
+def _dedupe_extras_preserve_order(items: list[str]) -> list[str]:
+    """Убирает дубликаты по ключу синонимов, канонизирует отображение."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in items:
+        mk = ingredient_merge_key(x)
+        if not mk or mk in seen:
             continue
-        key = cleaned.casefold()
-        if key not in seen:
-            seen[key] = cleaned
-    return sorted(seen.values(), key=lambda x: x.casefold())
+        seen.add(mk)
+        out.append(canonical_ingredient_display(x))
+    return out
 
 
 class AddRecipeStates(StatesGroup):
@@ -156,6 +185,7 @@ class QuizStates(StatesGroup):
     awaiting_next_dish_name = State()
     awaiting_addition_choice = State()
     after_shopping_list = State()  # список уже показан; можно снова проверить последнее блюдо
+    awaiting_manual_product = State()  # ждём текст: продукты в список вручную
 
 
 def init_db() -> None:
@@ -295,7 +325,7 @@ def ingredient_quiz_keyboard(recipe_id: int, ingredient_index: int) -> InlineKey
 def addition_prompt_keyboard() -> InlineKeyboardMarkup:
     """
     Кнопки после завершения квиза под последним блюдом.
-    «Проверить ингредиенты» — только под сообщением «Квиз по блюду … завершён».
+    «Проверить ингредиенты» — только под сообщением после последнего шага квиза.
     """
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -307,21 +337,42 @@ def addition_prompt_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="🏁 Завершить",
+                    text="🛒 Добавить продукт",
+                    callback_data="multi:add_product",
+                ),
+                InlineKeyboardButton(
+                    text="📋 Посмотреть список",
                     callback_data="multi:finish",
-                )
+                ),
+            ],
+        ]
+    )
+
+
+def shopping_list_actions_keyboard() -> InlineKeyboardMarkup:
+    """Под финальным списком покупок после «Посмотреть список»."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🛒 Добавить продукт",
+                    callback_data="multi:add_product",
+                ),
+            ],
+            [
+                InlineKeyboardButton(text="🆕 Создать новый список", callback_data="multi:new_planning"),
             ],
         ]
     )
 
 
 def quiz_finished_recheck_keyboard(recipe_id: int) -> InlineKeyboardMarkup:
-    """Под строкой «Квиз по блюду … завершён» — повторить квиз для этого блюда."""
+    """Под строкой после квиза — повторить квиз для этого блюда."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Проверить ингредиенты",
+                    text="✅ Проверить ингредиенты",
                     callback_data=f"multi:edit_dish:{int(recipe_id)}",
                 ),
             ],
@@ -329,31 +380,25 @@ def quiz_finished_recheck_keyboard(recipe_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def render_shopping_list_html(products: list[str]) -> str:
+def render_shopping_list_html_from_buckets(
+    buckets: list[dict],
+    extras: list[str] | None = None,
+) -> str | None:
     """
-    Маркированный список: название товара — ссылка на поиск на magnit.ru
-    (URL скрыт в тексте). Дубликаты убираются, порядок — по алфавиту.
+    Список покупок по корзинам блюд: синонимы объединяются, подпись вида
+    «Морковь (для борща и для плова)». Каждая строка — ссылка на поиск в Магните.
+    extras — дополнительные продукты от пользователя (тот же формат, эмодзи и ссылки).
+    Возвращает None, если покупать нечего.
     """
-    unique_products = unique_sorted_casefold(products)
-    if not unique_products:
-        return "• (пусто)"
+    rows = shopping_lines_from_buckets(buckets, extras=extras)
+    if not rows:
+        return None
     lines: list[str] = []
-    for product in unique_products:
-        url = build_magnit_search_url(product)
-        lines.append(
-            f"• <a href=\"{html.escape(url)}\">{html.escape(product)}</a>"
-        )
+    for search_term, label_plain in rows:
+        url = build_magnit_search_url(search_term)
+        inner = f"{emoji_for_ingredient(search_term)} {label_plain}"
+        lines.append(f"• <a href=\"{html.escape(url)}\">{html.escape(inner)}</a>")
     return "\n".join(lines)
-
-
-def _bucket_missing(buckets: list[dict]) -> list[str]:
-    """Собирает плоский список missing из accumulated_buckets."""
-    items: list[str] = []
-    for bucket in buckets or []:
-        missing = bucket.get("missing", [])
-        if isinstance(missing, list):
-            items.extend([str(x) for x in missing])
-    return items
 
 
 def _upsert_bucket(buckets: list[dict], recipe: str, missing: list[str]) -> list[dict]:
@@ -416,15 +461,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     """Приветствие и краткая инструкция по использованию бота."""
     await _clear_last_keyboard(message.bot, state)
     await state.clear()
-    text = (
-        "Привет! 👋 Я помогу проверить ингредиенты для блюда.\n\n"
-        "Что умею:\n"
-        "• /recipes — показать список блюд 📋\n"
-        "• /add_recipe — добавить новое блюдо (только админ) 🧑‍🍳\n"
-        "• /cancel — выйти из текущего диалога ❌\n\n"
-        "Просто напиши название блюда, и я запущу мини-квиз по ингредиентам 😉"
-    )
-    await message.answer(text)
+    await message.answer(START_HELP_TEXT)
 
 
 @router.message(Command("recipes"))
@@ -439,7 +476,7 @@ async def cmd_recipes(message: Message) -> None:
         return
 
     # Показываем названия с большой буквы (как требовалось).
-    lines = [f"• {name.capitalize()}" for name in recipes]
+    lines = [f"• {emoji_for_dish(name)} {name.capitalize()}" for name in recipes]
     await message.answer("Доступные блюда 🍽️:\n" + "\n".join(lines))
 
 
@@ -503,11 +540,11 @@ async def process_ingredients(message: Message, state: FSMContext) -> None:
     await state.clear()
 
     if not success:
-        await message.answer(f"⚠️ Блюдо «{recipe_name}» уже существует.")
+        await message.answer(f"⚠️ Блюдо {format_dish_title(recipe_name)} уже существует.")
         return
 
     await message.answer(
-        f"✅ Блюдо «{recipe_name}» успешно сохранено!\n"
+        f"✅ Блюдо {format_dish_title(recipe_name)} успешно сохранено!\n"
         "Теперь пользователи могут найти его по названию."
     )
 
@@ -520,9 +557,98 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
         await message.answer("Сейчас нет активного диалога 🙂")
         return
 
+    if current_state == QuizStates.awaiting_manual_product.state:
+        data = await state.get_data()
+        ret_state = data.get("manual_product_return_state")
+        await _clear_last_keyboard(message.bot, state)
+        await state.update_data(manual_product_return_state=None)
+        await state.set_state(ret_state if ret_state else QuizStates.after_shopping_list.state)
+        await message.answer("Добавление продуктов отменено.")
+        return
+
     await _clear_last_keyboard(message.bot, state)
     await state.clear()
     await message.answer("Диалог отменен ✅ Можете выбрать другое блюдо.")
+
+
+@router.message(StateFilter(QuizStates.awaiting_manual_product), F.text & ~F.text.startswith("/"))
+async def handle_manual_shopping_items(message: Message, state: FSMContext) -> None:
+    """Продукты в список вручную (одна или несколько позиций через запятую)."""
+    user_text = (message.text or "").strip()
+    parts = [p.strip() for p in user_text.split(",") if p.strip()]
+    if not parts:
+        await message.answer(
+            "Укажите хотя бы один продукт или отправьте /cancel.",
+        )
+        return
+
+    data = await state.get_data()
+    ret_state = data.get("manual_product_return_state")
+    buckets_raw = data.get("accumulated_buckets")
+    buckets = copy.deepcopy(buckets_raw) if isinstance(buckets_raw, list) else []
+
+    extras_prev = _dedupe_extras_preserve_order(_coerce_extras_list(data.get("shopping_list_extras")))
+    keys_seen: set[str] = {ingredient_merge_key(x) for x in extras_prev}
+    for b in buckets:
+        miss = b.get("missing")
+        if not isinstance(miss, list):
+            continue
+        for m in miss:
+            mk = ingredient_merge_key(str(m))
+            if mk:
+                keys_seen.add(mk)
+    added_labels: list[str] = []
+    for part in parts:
+        mk = ingredient_merge_key(part)
+        if not mk:
+            continue
+        if mk in keys_seen:
+            continue
+        keys_seen.add(mk)
+        disp = canonical_ingredient_display(part)
+        extras_prev.append(disp)
+        added_labels.append(disp)
+
+    extras_prev = _dedupe_extras_preserve_order(extras_prev)
+
+    await state.update_data(
+        shopping_list_extras=extras_prev,
+        accumulated_buckets=buckets,
+        manual_product_return_state=None,
+    )
+
+    target_state = ret_state if ret_state else QuizStates.after_shopping_list.state
+    await state.set_state(target_state)
+
+    if target_state == QuizStates.after_shopping_list.state:
+        body = render_shopping_list_html_from_buckets(buckets, extras_prev)
+        if body:
+            head = ""
+            if added_labels:
+                head = "Добавлено: " + ", ".join(added_labels) + "\n\n"
+            await message.answer(
+                head + f"📦 Общий список покупок:\n{body}",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=shopping_list_actions_keyboard(),
+            )
+        else:
+            await message.answer(
+                "В списке пока пусто — добавьте продукты или пройдите квиз по блюду.",
+                reply_markup=shopping_list_actions_keyboard(),
+            )
+        return
+
+    if added_labels:
+        await message.answer(
+            "Добавлено в список: " + ", ".join(added_labels),
+            reply_markup=addition_prompt_keyboard(),
+        )
+    else:
+        await message.answer(
+            "Эти позиции уже есть в списке или совпадают с тем, что из блюд.",
+            reply_markup=addition_prompt_keyboard(),
+        )
 
 
 @router.message(F.text & ~F.text.startswith("/"))
@@ -536,11 +662,31 @@ async def handle_recipe_search(message: Message, state: FSMContext) -> None:
         return
 
     current_state = await state.get_state()
-    # Если бот ждёт нажатия кнопки/перехода — не начинаем новый квиз по тексту.
-    if current_state in {
-        QuizStates.awaiting_addition_choice.state,
-        QuizStates.after_shopping_list.state,
-    }:
+
+    if current_state == QuizStates.awaiting_manual_product.state:
+        return
+
+    # После показа итогового списка можно просто написать новое блюдо — новый квиз без нажатия кнопки.
+    # Сохраняем корзину и доп. продукты (state.clear() их стирает).
+    if current_state == QuizStates.after_shopping_list.state:
+        await _clear_last_keyboard(message.bot, state)
+        snap = await state.get_data()
+        buckets_raw = snap.get("accumulated_buckets")
+        buckets_copy = copy.deepcopy(buckets_raw) if isinstance(buckets_raw, list) else []
+        extras_copy = _dedupe_extras_preserve_order(_coerce_extras_list(snap.get("shopping_list_extras")))
+        lr = snap.get("last_recipe_name")
+        ff = bool(snap.get("final_list_shown", False))
+        acc = bool(snap.get("accumulation_started", False))
+        await state.clear()
+        await state.update_data(
+            accumulated_buckets=buckets_copy,
+            shopping_list_extras=extras_copy,
+            last_recipe_name=lr,
+            final_list_shown=ff,
+            accumulation_started=acc,
+        )
+
+    if current_state == QuizStates.awaiting_addition_choice.state:
         await message.answer("Сначала выберите кнопки ниже ✅")
         return
     if current_state == QuizStates.in_progress.state:
@@ -560,11 +706,13 @@ async def handle_recipe_search(message: Message, state: FSMContext) -> None:
     recipe_id, recipe_name, ingredients = found
     if not ingredients:
         await message.answer(
-            f"Для блюда «{recipe_name}» пока нет ингредиентов в базе."
+            f"Для блюда {format_dish_title(recipe_name)} пока нет ингредиентов в базе."
         )
         return
 
-    # Начинаем квиз по выбранному блюду.
+    # Запускаем опрос ингредиентов для выбранного блюда.
+    prev_data = await state.get_data()
+    extras_keep = _dedupe_extras_preserve_order(_coerce_extras_list(prev_data.get("shopping_list_extras")))
     await state.set_state(QuizStates.in_progress)
     await state.update_data(
         quiz_recipe_id=recipe_id,
@@ -573,12 +721,13 @@ async def handle_recipe_search(message: Message, state: FSMContext) -> None:
         quiz_index=0,
         shopping_list=[],
         editing_last=False,
+        shopping_list_extras=extras_keep,
     )
 
     first_ingredient = ingredients[0]
     await message.answer(
-        f"Начинаем квиз по блюду «{recipe_name}» 🍳\n"
-        f"У тебя есть {first_ingredient}?",
+        f"Проверим, всё ли у тебя есть для того, чтобы приготовить {format_dish_title(recipe_name)}\n"
+        f"У тебя есть {format_ingredient_display(first_ingredient)}?",
         reply_markup=ingredient_quiz_keyboard(recipe_id, 0),
     )
 
@@ -613,9 +762,9 @@ async def process_quiz_answer(callback: CallbackQuery, state: FSMContext) -> Non
     current_index = data.get("quiz_index", 0)
     shopping_list = data.get("shopping_list", [])
 
-    # Дополнительная проверка: если callback устарел, аккуратно игнорируем.
+    # Устаревший callback (двойное нажатие и т.п.) — тихо игнорируем.
     if recipe_id != cb_recipe_id or current_index != cb_index or cb_index >= len(ingredients):
-        await callback.answer("Этот шаг уже неактуален.", show_alert=False)
+        await callback.answer()
         return
 
     ingredient = ingredients[current_index]
@@ -633,13 +782,13 @@ async def process_quiz_answer(callback: CallbackQuery, state: FSMContext) -> Non
         next_ingredient = ingredients[next_index]
         try:
             await callback.message.edit_text(
-                f"У тебя есть {next_ingredient}?",
+                f"У тебя есть {format_ingredient_display(next_ingredient)}?",
                 reply_markup=ingredient_quiz_keyboard(recipe_id, next_index),
             )
         except TelegramBadRequest:
             # Если Telegram не дал отредактировать (редкий случай), отправляем новое сообщение.
             await callback.message.answer(
-                f"У тебя есть {next_ingredient}?",
+                f"У тебя есть {format_ingredient_display(next_ingredient)}?",
                 reply_markup=ingredient_quiz_keyboard(recipe_id, next_index),
             )
         return
@@ -648,7 +797,10 @@ async def process_quiz_answer(callback: CallbackQuery, state: FSMContext) -> Non
     rid = int(data.get("quiz_recipe_id") or 0)
 
     # Заменяем текст последнего вопроса и показываем «Проверить ингредиенты» здесь же (не под списком покупок).
-    closing_text = f"Квиз по блюду «{recipe_name}» завершён ✅"
+    closing_text = (
+        "Сохранил ингредиенты в список покупок. "
+        "Добавим новое блюдо или посмотрим список?"
+    )
     kb = quiz_finished_recheck_keyboard(rid) if rid > 0 else None
     try:
         await callback.message.edit_text(closing_text, reply_markup=kb)
@@ -656,7 +808,7 @@ async def process_quiz_answer(callback: CallbackQuery, state: FSMContext) -> Non
         if callback.message:
             await callback.message.answer(closing_text, reply_markup=kb)
 
-    # Квиз завершён: общий список с Магнитом после «🏁 Завершить» или сразу после обновления блюда,
+    # Квиз завершён: общий список с Магнитом после «Посмотреть список» или сразу после обновления блюда,
     # если список уже показывали ранее (final_list_shown).
 
     # buckets: [{"recipe": "...", "missing": ["..."]}, ...]
@@ -672,25 +824,28 @@ async def process_quiz_answer(callback: CallbackQuery, state: FSMContext) -> Non
 
     buckets = _upsert_bucket(buckets, recipe=str(recipe_name), missing=dish_missing)
 
+    extras_keep = _dedupe_extras_preserve_order(_coerce_extras_list(data.get("shopping_list_extras")))
+
     await state.update_data(
         accumulated_buckets=buckets,
         last_recipe_name=str(recipe_name),
         editing_last=False,
+        shopping_list_extras=extras_keep,
     )
 
     await state.set_state(QuizStates.awaiting_addition_choice)
     keyboard_text = (
-        f"✅ Блюдо «{recipe_name}» обновлено! Что дальше?"
+        f"✅ Блюдо {format_dish_title(recipe_name)} обновлено! Что дальше?"
         if was_editing
-        else f"✅ Блюдо «{recipe_name}» добавлено! Что дальше?"
+        else f"✅ Блюдо {format_dish_title(recipe_name)} добавлено! Что дальше?"
     )
 
     # Уже выводили общий список и пользователь заново прошёл квиз по блюду — обновляем список сразу.
     if final_list_shown and was_editing and callback.message:
-        all_missing = _bucket_missing(buckets)
-        if unique_sorted_casefold(all_missing):
+        shop_body = render_shopping_list_html_from_buckets(buckets, extras_keep)
+        if shop_body:
             await callback.message.answer(
-                f"📦 Общий список покупок:\n{render_shopping_list_html(all_missing)}",
+                f"📦 Общий список покупок:\n{shop_body}",
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
@@ -703,6 +858,28 @@ async def process_quiz_answer(callback: CallbackQuery, state: FSMContext) -> Non
         await _send_keyboard_message(callback.message, state, keyboard_text)
     else:
         await _clear_last_keyboard(callback.bot, state)
+
+
+@router.callback_query(F.data == "multi:add_product")
+async def multi_add_product(callback: CallbackQuery, state: FSMContext) -> None:
+    """Запрос строки с продуктами для ручного добавления в общий список покупок."""
+    current_state = await state.get_state()
+    if current_state not in {
+        QuizStates.awaiting_addition_choice.state,
+        QuizStates.after_shopping_list.state,
+    }:
+        await callback.answer("Сейчас недоступно.", show_alert=False)
+        return
+
+    await callback.answer()
+    await state.update_data(manual_product_return_state=current_state)
+    await state.set_state(QuizStates.awaiting_manual_product)
+    if callback.message:
+        await callback.message.answer(
+            "Напишите продукты для списка покупок через запятую.\n"
+            "Например: хлеб, молоко, масло\n\n"
+            "Отмена — /cancel."
+        )
 
 
 @router.callback_query(F.data == "multi:add_more")
@@ -723,7 +900,7 @@ async def multi_add_more(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("multi:edit_dish:"))
 async def multi_edit_dish(callback: CallbackQuery, state: FSMContext) -> None:
-    """Повторный квиз для выбранного блюда (кнопка под «Квиз по блюду … завершён»)."""
+    """Повторный квиз для выбранного блюда (кнопка под сообщением после квиза)."""
     if callback.message is None:
         await callback.answer()
         return
@@ -787,10 +964,12 @@ async def multi_edit_dish(callback: CallbackQuery, state: FSMContext) -> None:
             buckets = []
         rk = recipe_name.casefold()
         buckets = [b for b in buckets if str(b.get("recipe", "")).casefold() != rk]
+        extras_keep = _dedupe_extras_preserve_order(_coerce_extras_list(data.get("shopping_list_extras")))
         await state.update_data(
             accumulated_buckets=buckets,
             editing_last=True,
             last_recipe_name=recipe_name,
+            shopping_list_extras=extras_keep,
         )
 
         await state.set_state(QuizStates.in_progress)
@@ -800,18 +979,19 @@ async def multi_edit_dish(callback: CallbackQuery, state: FSMContext) -> None:
             quiz_ingredients=ingredients,
             quiz_index=0,
             shopping_list=[],
+            shopping_list_extras=extras_keep,
         )
 
         await callback.message.answer(
-            f"Редактируем блюдо «{recipe_name}» ✏️\n"
-            f"У тебя есть {ingredients[0]}?",
+            f"Редактируем блюдо {format_dish_title(recipe_name)} ✏️\n"
+            f"У тебя есть {format_ingredient_display(ingredients[0])}?",
             reply_markup=ingredient_quiz_keyboard(recipe_id, 0),
         )
 
 
 @router.callback_query(F.data == "multi:finish")
 async def multi_finish(callback: CallbackQuery, state: FSMContext) -> None:
-    """«🏁 Завершить»: показываем список; «Проверить ингредиенты» остаётся под сообщением «Квиз завершён»."""
+    """«Посмотреть список»: показываем список; «Проверить ингредиенты» остаётся под сообщением после квиза."""
     current_state = await state.get_state()
     if current_state != QuizStates.awaiting_addition_choice.state:
         await callback.answer("Сейчас нельзя завершить.", show_alert=False)
@@ -828,11 +1008,14 @@ async def multi_finish(callback: CallbackQuery, state: FSMContext) -> None:
     if not last_recipe and buckets:
         last_recipe = str(buckets[-1].get("recipe", ""))
 
+    extras = _dedupe_extras_preserve_order(_coerce_extras_list(data.get("shopping_list_extras")))
+    saved_extras = copy.deepcopy(extras)
+
     saved_buckets = copy.deepcopy(buckets)
 
-    all_missing = _bucket_missing(buckets)
-    if unique_sorted_casefold(all_missing):
-        result_text = f"📦 Общий список покупок:\n{render_shopping_list_html(all_missing)}"
+    shop_body = render_shopping_list_html_from_buckets(buckets, extras)
+    if shop_body:
+        result_text = f"📦 Общий список покупок:\n{shop_body}"
         parse_mode = "HTML"
     else:
         result_text = "📦 Общий список покупок пуст — у вас всё уже есть ✅"
@@ -840,24 +1023,58 @@ async def multi_finish(callback: CallbackQuery, state: FSMContext) -> None:
 
     await _clear_last_keyboard(callback.bot, state)
 
-    keep_after_list = bool(saved_buckets) or bool(str(last_recipe or "").strip())
+    keep_after_list = (
+        bool(saved_buckets)
+        or bool(saved_extras)
+        or bool(str(last_recipe or "").strip())
+    )
 
     await state.clear()
+    await state.set_state(QuizStates.after_shopping_list)
+    payload: dict = {}
     if keep_after_list:
-        await state.set_state(QuizStates.after_shopping_list)
-        await state.update_data(
-            accumulated_buckets=saved_buckets,
-            last_recipe_name=str(last_recipe),
-            accumulation_started=True,
-            final_list_shown=True,
+        payload.update(
+            {
+                "accumulated_buckets": saved_buckets,
+                "shopping_list_extras": saved_extras,
+                "last_recipe_name": str(last_recipe),
+                "accumulation_started": True,
+                "final_list_shown": True,
+            }
         )
+    if payload:
+        await state.update_data(**payload)
 
     if callback.message:
-        await callback.message.answer(
-            result_text,
-            parse_mode=parse_mode,
-            disable_web_page_preview=True,
-        )
+        send_kw: dict = {
+            "reply_markup": shopping_list_actions_keyboard(),
+            "disable_web_page_preview": True,
+        }
+        if parse_mode:
+            send_kw["parse_mode"] = parse_mode
+        await callback.message.answer(result_text, **send_kw)
+
+
+@router.callback_query(F.data == "multi:new_planning")
+async def multi_new_planning(callback: CallbackQuery, state: FSMContext) -> None:
+    """Сброс как после /start."""
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    await callback.answer()
+
+    chat_id = callback.message.chat.id
+    bot = callback.bot
+
+    try:
+        await callback.message.delete()
+    except TelegramBadRequest:
+        logging.exception("Не удалось удалить сообщение со списком")
+
+    await _clear_last_keyboard(bot, state)
+    await state.clear()
+    await bot.send_message(chat_id, START_HELP_TEXT)
 
 
 @router.errors()
