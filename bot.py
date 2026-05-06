@@ -532,11 +532,10 @@ async def process_quiz_answer(callback: CallbackQuery, state: FSMContext) -> Non
 
     # Квиз завершен.
     # По требованиям:
-    # - в режиме накопления не выводим список покупок сразу (покажем при "Завершить");
-    # - в обычном режиме показываем список для одного блюда сразу;
-    # - вместо этого спрашиваем: добавить ещё одно блюдо или завершить.
+    # - не выводим список покупок после каждого блюда (в т.ч. после первого);
+    # - список показываем только после нажатия "🏁 Завершить";
+    # - после квиза показываем кнопки "Добавить ещё блюдо" / "Завершить".
     recipe_name = data.get("quiz_recipe_name", "выбранного блюда")
-    accumulation_started = bool(data.get("accumulation_started", False))
 
     accumulated_missing = data.get("accumulated_missing", [])
     if not isinstance(accumulated_missing, list):
@@ -550,26 +549,7 @@ async def process_quiz_answer(callback: CallbackQuery, state: FSMContext) -> Non
     )
     await state.set_state(QuizStates.awaiting_addition_choice)
 
-    prompt_text = "Блюдо добавлено! Хотите добавить ещё одно блюдо или завершить?"
-
-    if not accumulation_started:
-        # Обычный режим: сразу показываем список покупок для текущего блюда.
-        if shopping_list:
-            dish_list_text = render_shopping_list(shopping_list)
-            result_text = f"Для блюда «{recipe_name}» нужно купить:\n{dish_list_text}"
-        else:
-            result_text = f"Для блюда «{recipe_name}» у вас уже есть все ингредиенты ✅"
-
-        try:
-            await callback.message.edit_text(result_text)
-        except TelegramBadRequest:
-            await callback.message.answer(result_text)
-
-        if callback.message:
-            await callback.message.answer(prompt_text, reply_markup=addition_prompt_keyboard())
-        return
-
-    # Режим накопления: не показываем список, только предлагаем продолжить/завершить.
+    prompt_text = "✅ Блюдо добавлено! Хотите добавить ещё одно блюдо или завершить?"
     try:
         await callback.message.edit_text(prompt_text, reply_markup=addition_prompt_keyboard())
     except TelegramBadRequest:
