@@ -322,8 +322,8 @@ def shopping_lines_from_buckets(
     extras — продукты, добавленные пользователем; попадают в тот же формат (ссылка + эмодзи снаружи).
     Дубликаты по синонимам с позициями из блюд объединяются.
 
-    Возвращает список пар (текст для поиска на magnit.ru без скобок «(1 шт)» и т.д.,
-    подпись для пользователя в HTML — тоже без таких скобок).
+    Возвращает список пар (текст для поиска на magnit.ru — без скобок «(250 мл)» и т.д.;
+    подпись для пользователя — с исходными скобками из рецепта, например «Лайм (5 шт)»).
     Фраза «(для борща и для плова, …)» добавляется только если один и тот же ингредиент
     к покупке относится к двум и более блюдам.
 
@@ -373,12 +373,12 @@ def shopping_lines_from_buckets(
         clause = (
             format_dishes_clause(recipes_list) if len(recipes_list) >= 2 else ""
         )
-        base = strip_parenthetical_segments(display) or display.strip()
-        search_term = base
+        label_base = " ".join(display.split())
+        search_term = strip_parenthetical_segments(display) or label_base
         if clause:
-            label_core = f"{base} ({clause})"
+            label_core = f"{label_base} ({clause})"
         else:
-            label_core = base
+            label_core = label_base
         rows.append((search_term, label_core))
 
     return rows

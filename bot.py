@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sqlite3
+from typing import Any
 from urllib.parse import quote
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -24,6 +25,14 @@ from ingredient_synonyms import (
     shopping_lines_from_buckets,
 )
 from recipe_normalize import normalize_recipe_name, recipe_search_key
+
+try:
+    from pymorphy3 import MorphAnalyzer as _PymorphRecipeSearchCls
+except ImportError:  # pragma: no cover
+    try:
+        from pymorphy2 import MorphAnalyzer as _PymorphRecipeSearchCls
+    except ImportError:
+        _PymorphRecipeSearchCls = None
 
 # Транслитерация для названий блюд подключена в recipe_normalize.py (опционально transliterate).
 
@@ -65,6 +74,87 @@ ASK_DISH_NAME_TEXT = "Напишите название блюда, которо
 
 _SIM_WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 _CY_SOFT_SIGN_RE = re.compile(r"[ьъ]")
+_RX_CYRILLIC_WORD_RE = re.compile(r"[а-яё]", re.IGNORECASE)
+_RECIPE_SEARCH_MORPH: Any | None | bool = False
+
+# Слова-приёмы («в кляре», панировка): при ранжировании ниже, чем продукт («курочка» и т.д.).
+_RECIPE_TITLE_LOW_WEIGHT_TOKENS: frozenset[str] = frozenset(
+    {
+        "кляр",
+        "кляре",
+        "кляра",
+        "кляром",
+        "панировке",
+        "панировка",
+        "панировки",
+        "панированная",
+        "панированный",
+        "панированное",
+        "панированные",
+    }
+)
+
+# Подгонка главного продукта в запросе к типичному написанию в названии рецепта.
+_RECIPE_SCORING_ALIASES: dict[str, tuple[str, ...]] = {
+    "курочка": ("курица", "цыпленок", "цыпленка", "куриное", "куриные", "куриный"),
+}
+
+
+def _recipe_search_morph_analyzer():
+    """
+    Одна копия MorphAnalyzer для нормализации падежей в запросах («курочку» → словарная форма).
+    Если pymorphy не установлен — None.
+    """
+    global _RECIPE_SEARCH_MORPH
+    if _RECIPE_SEARCH_MORPH is False:
+        if _PymorphRecipeSearchCls is None:
+            _RECIPE_SEARCH_MORPH = None
+        else:
+            try:
+                _RECIPE_SEARCH_MORPH = _PymorphRecipeSearchCls()
+            except Exception:
+                logging.exception(
+                    "Не удалось инициализировать MorphAnalyzer для поиска рецептов"
+                )
+                _RECIPE_SEARCH_MORPH = None
+    return _RECIPE_SEARCH_MORPH
+
+
+_RECIPE_SEARCH_MANUAL_SURFACE_TO_NORMAL: dict[str, str] = {
+    "курочку": "курочка",
+    "курочки": "курочка",
+    "курочкой": "курочка",
+    "курицу": "курица",
+    "курицы": "курица",
+    "цыпленка": "цыпленок",
+    "цыпленку": "цыпленок",
+}
+
+
+def search_token_normalized_forms(word_cf: str) -> tuple[str, ...]:
+    """
+    Формы одного значимого слова для расширения LIKE: как ввели + нормальная форма (pymorphy).
+    """
+    wf = (word_cf or "").strip().casefold()
+    if len(wf) < 3:
+        return (wf,)
+    forms: dict[str, None] = {wf: None}
+    mf = (_RECIPE_SEARCH_MANUAL_SURFACE_TO_NORMAL.get(wf) or "").strip().casefold()
+    if len(mf) >= 2:
+        forms[mf] = None
+    if _RX_CYRILLIC_WORD_RE.search(wf):
+        morph = _recipe_search_morph_analyzer()
+        if morph is not None:
+            try:
+                parsed = morph.parse(wf)
+                if parsed:
+                    nf = str(parsed[0].normal_form).casefold().strip()
+                    if len(nf) >= 2:
+                        forms[nf] = None
+            except Exception:
+                logging.exception("morph для токена поиска %r", wf)
+    return tuple(forms.keys())
+
 
 # Telegram ID администратора: только он может добавлять блюда.
 ADMIN_ID = 69026978
@@ -328,6 +418,54 @@ def collect_search_keys(normalized_name: str) -> list[str]:
     return keys
 
 
+def like_variants_for_query_word(w_cf: str) -> list[str]:
+    """Подстроки для LIKE по name_search: слово во всех падежах (через лемму) + синонимы курочка→курица."""
+    w_cf = (w_cf or "").strip().casefold()
+    if len(w_cf) < 3:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for root in search_token_normalized_forms(w_cf):
+        for phrase in _RECIPE_SCORING_ALIASES.get(root, ()) + (root,):
+            nm = normalize_recipe_name(str(phrase)).strip()
+            if not nm:
+                continue
+            for k in collect_search_keys(nm):
+                if k not in seen:
+                    seen.add(k)
+                    out.append(k)
+    return out
+
+
+def ordered_like_search_patterns(normalized_query: str) -> list[str]:
+    """
+    Паттерны LIKE в порядке приоритета: целый запрос, затем по очереди слова с синонимами.
+    Нужно, чтобы «курочка в кляре» находила и «курица в кляре» в базе.
+    """
+    nm = normalize_recipe_name(normalized_query).strip()
+    nm = " ".join(nm.split())
+    if not nm:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def push_key(k: str) -> None:
+        if len(k) < 2 or k in seen:
+            return
+        seen.add(k)
+        out.append(k)
+
+    for k in collect_search_keys(nm):
+        push_key(k)
+    for w in _SIM_WORD_RE.findall(nm.casefold()):
+        wf = w.casefold()
+        if len(wf) < 3:
+            continue
+        for vk in like_variants_for_query_word(wf):
+            push_key(vk)
+    return out
+
+
 def similarity_tokens(query_key: str) -> list[str]:
     """Токены для подбора похожих рецептов (длинные — раньше) + укр./рус. варианты слов."""
     query_key_cf = (query_key or "").strip().casefold()
@@ -346,9 +484,8 @@ def similarity_tokens(query_key: str) -> list[str]:
     words = _SIM_WORD_RE.findall(query_key_cf)
     for w in sorted(words, key=len, reverse=True):
         cf = w.casefold()
-        add(cf)
-        for sk in collect_search_keys(cf):
-            add(sk)
+        for vk in like_variants_for_query_word(cf):
+            add(vk)
     return out
 
 
@@ -358,7 +495,7 @@ def search_recipe_ids_substring(normalized_query: str) -> list[int]:
     seen: set[int] = set()
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
-        for key in collect_search_keys(normalized_query):
+        for key in ordered_like_search_patterns(normalized_query):
             pat = f"%{sql_like_escape(key)}%"
             cur.execute(
                 "SELECT id FROM recipes WHERE name_search LIKE ? ESCAPE '\\' ORDER BY id",
@@ -375,7 +512,7 @@ def search_recipe_ids_substring(normalized_query: str) -> list[int]:
 def search_recipe_ids_all_significant_words(normalized_query: str) -> list[int]:
     """
     Все значимые слова запроса (≥3 символа) должны встречаться в названии
-    (каждое — как подстрока, с вариантами collect_search_keys).
+    (каждое — как подстрока; для слова добавляются варианты и синонимы, см. курочка→курица).
     """
     nm = normalize_recipe_name(normalized_query).strip()
     nm = " ".join(nm.split())
@@ -387,7 +524,7 @@ def search_recipe_ids_all_significant_words(normalized_query: str) -> list[int]:
         conj_parts: list[str] = []
         params: list[str] = []
         for w in words:
-            variants = collect_search_keys(w)
+            variants = like_variants_for_query_word(w)
             if not variants:
                 return []
             or_parts = ["name_search LIKE ? ESCAPE '\\'" for _ in variants]
@@ -431,6 +568,74 @@ def fetch_similar_recipe_ids(query_key: str, exclude: set[int], limit: int = 40)
                 if len(out) >= limit:
                     return out
     return out
+
+
+def _title_contains_token_variant(name_cf: str, token_cf: str) -> bool:
+    """Подстрока в названии: падеж пользователя→лемма→синонимы."""
+    needles: list[str] = []
+    seen: set[str] = set()
+    for root in search_token_normalized_forms(token_cf):
+        for phrase in _RECIPE_SCORING_ALIASES.get(root, ()) + (root,):
+            p = normalize_recipe_name(str(phrase)).strip()
+            if not p:
+                continue
+            pf = p.casefold()
+            for fragment in {pf} | set(collect_search_keys(pf)):
+                if not fragment or fragment in seen:
+                    continue
+                seen.add(fragment)
+                needles.append(fragment)
+    return any(h in name_cf for h in needles)
+
+
+def recipe_title_relevance_score(recipe_title: str, normalized_query: str) -> float:
+    """
+    Чем выше оценка, тем лучше название рецепта отвечает запросу.
+    Первые значимые слова запроса (продукт) важнее хвоста («в кляре», панировка).
+    """
+    name_cf = recipe_title.casefold()
+    q = " ".join(normalize_recipe_name(normalized_query).split()).strip().casefold()
+    words = [w.casefold() for w in _SIM_WORD_RE.findall(q) if len(w) >= 3]
+    if not words:
+        if not q:
+            return 1.0
+        return 2.0 if q in name_cf else 0.0
+
+    nw = len(words)
+    score = 0.0
+    if q in name_cf:
+        score += float(nw + 3)
+
+    for i, w in enumerate(words):
+        pos_weight = float(nw - i)
+        coef = 0.25 if w in _RECIPE_TITLE_LOW_WEIGHT_TOKENS else 1.0
+        if _title_contains_token_variant(name_cf, w):
+            score += pos_weight * coef
+    return score
+
+
+def _load_recipe_titles_for_ids(ids: list[int]) -> dict[int, str]:
+    if not ids:
+        return {}
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        qs = ",".join("?" * len(ids))
+        cur.execute(f"SELECT id, name FROM recipes WHERE id IN ({qs})", ids)
+        return {int(r[0]): str(r[1]) for r in cur.fetchall()}
+
+
+def rank_recipe_ids_for_query(ids: list[int], normalized_query: str) -> list[int]:
+    """Стабильно переставляет найденные id: ближе к запросу по смыслу — раньше в списке."""
+    uniq = list(dict.fromkeys(int(i) for i in ids))
+    if len(uniq) <= 1:
+        return uniq
+    titles = _load_recipe_titles_for_ids(uniq)
+    scored = [
+        (-recipe_title_relevance_score(titles.get(rid, ""), normalized_query), i, rid)
+        for i, rid in enumerate(uniq)
+    ]
+    scored.sort(key=lambda row: (row[0], row[1]))
+    return [rid for (_, __, rid) in scored]
 
 
 def filter_recipe_ids_with_ingredients(ids: list[int]) -> list[int]:
@@ -832,7 +1037,8 @@ def render_shopping_list_html_from_buckets(
 ) -> str | None:
     """
     Список покупок по корзинам блюд: синонимы объединяются, подпись вида
-    «Морковь (для борща и для плова)». Каждая строка — ссылка на поиск в Магните.
+    «Морковь (для борща и для плова)». Ссылка строится по названию без текста в скобках;
+    в тексте строки скобки из рецепта (количество, единицы) сохраняются.
     extras — дополнительные продукты от пользователя (тот же формат, эмодзи и ссылки).
     Возвращает None, если покупать нечего.
     """
@@ -1173,16 +1379,30 @@ async def handle_recipe_search(message: Message, state: FSMContext) -> None:
     normalized_name = " ".join(normalize_recipe_name(user_text).split())
     query_key = recipe_search_key(normalized_name)
 
-    primary_ids = search_recipe_ids_substring(normalized_name)
-    recipe_ids = filter_recipe_ids_with_ingredients(list(primary_ids))
-    if not recipe_ids:
+    sig_words = [
+        w.casefold()
+        for w in _SIM_WORD_RE.findall(normalized_name.casefold())
+        if len(w.casefold()) >= 3
+    ]
+    recipe_ids: list[int] = []
+
+    # Два и больше значимых слова: сначала AND по всем (с синонимами «курочка»→«курица»),
+    # иначе «в кляре» одно даёт сотни рыб, а курица не попадает в выдачу.
+    if len(sig_words) >= 2:
         recipe_ids = filter_recipe_ids_with_ingredients(
             search_recipe_ids_all_significant_words(normalized_name)
+        )
+
+    if not recipe_ids:
+        recipe_ids = filter_recipe_ids_with_ingredients(
+            search_recipe_ids_substring(normalized_name)
         )
     if not recipe_ids:
         recipe_ids = filter_recipe_ids_with_ingredients(
             fetch_similar_recipe_ids(query_key, set(), limit=80)
         )
+
+    recipe_ids = rank_recipe_ids_for_query(recipe_ids, normalized_name)
 
     if not recipe_ids:
         await message.answer(
