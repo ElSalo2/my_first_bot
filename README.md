@@ -23,6 +23,12 @@ Windows (перманентно):
 setx TELEGRAM_BOT_TOKEN "123:ABC"
 ```
 
+Или создайте файл `.env` рядом с `bot.py`:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=123:ABC
+```
+
 3. Запустите:
 
 ```bash

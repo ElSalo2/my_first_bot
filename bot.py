@@ -21,7 +21,30 @@ except ImportError:  # pragma: no cover
 
 # Токен бота нельзя хранить в репозитории. Берём из переменной окружения.
 # Пример: setx TELEGRAM_BOT_TOKEN "123:ABC"  (Windows)
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+def _load_token_from_dotenv(path: str = ".env") -> str | None:
+    """
+    Очень простой парсер .env (без зависимостей).
+    Ожидаем строку вида: TELEGRAM_BOT_TOKEN=...
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key.strip() == "TELEGRAM_BOT_TOKEN":
+                    return value.strip().strip("'\"")
+    except OSError:
+        logging.exception("Не удалось прочитать %s", path)
+    return None
+
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or _load_token_from_dotenv()
 
 # Telegram ID администратора: только он может добавлять блюда.
 ADMIN_ID = 69026978
@@ -86,8 +109,8 @@ def normalize_recipe_name(name: str) -> str:
     return normalized
 
 
-def build_pyaterochka_search_url(product_name: str) -> str:
-    """Формирует ссылку на поиск товара в Магните."""
+def build_magnit_search_url(product_name: str) -> str:
+    """Формирует ссылку на поиск товара в Магните (magnit.ru)."""
     return f"https://magnit.ru/search?term={quote(product_name)}"
 
 
@@ -118,7 +141,6 @@ class QuizStates(StatesGroup):
     """Состояния квиза по ингредиентам выбранного блюда."""
 
     in_progress = State()
-    awaiting_enable_addition = State()
     awaiting_next_dish_name = State()
     awaiting_addition_choice = State()
 
@@ -239,20 +261,11 @@ def ingredient_quiz_keyboard(recipe_id: int, ingredient_index: int) -> InlineKey
     )
 
 
-def new_dish_keyboard() -> InlineKeyboardMarkup:
-    """Кнопка для быстрого запуска нового выбора блюда (сброс состояния)."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔁 Новое блюдо", callback_data="new_dish")]
-        ]
-    )
-
-
 def addition_prompt_keyboard() -> InlineKeyboardMarkup:
     """
-    Кнопки после завершения квиза (в режиме накопления):
+    Кнопки после завершения квиза:
     - добавить ещё блюдо
-    - завершить и получить общий список
+    - завершить и получить список покупок
     """
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -264,11 +277,25 @@ def addition_prompt_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="📦 Завершить и получить общий список",
+                    text="🏁 Завершить",
                     callback_data="multi:finish",
                 )
             ],
         ]
+    )
+
+
+def render_shopping_list(products: list[str]) -> str:
+    """
+    Рендерит маркированный список покупок со ссылками на magnit.ru,
+    убирая дубликаты и сортируя без учёта регистра.
+    """
+    unique_products = unique_sorted_casefold(products)
+    if not unique_products:
+        return "• (пусто)"
+    return "\n".join(
+        f"• {product} — {build_magnit_search_url(product)}"
+        for product in unique_products
     )
 
 
@@ -398,7 +425,6 @@ async def handle_recipe_search(message: Message, state: FSMContext) -> None:
     # Если бот ждёт нажатия кнопки/перехода — не начинаем новый квиз по тексту.
     if current_state in {
         QuizStates.awaiting_addition_choice.state,
-        QuizStates.awaiting_enable_addition.state,
     }:
         await message.answer("Сначала выберите кнопки ниже ✅")
         return
@@ -504,112 +530,62 @@ async def process_quiz_answer(callback: CallbackQuery, state: FSMContext) -> Non
             )
         return
 
-    # Квиз завершен: формируем красивый маркированный список покупок
-    # с прямыми ссылками на поиск в Пятёрочке.
+    # Квиз завершен.
+    # По требованиям:
+    # - в режиме накопления не выводим список покупок сразу (покажем при "Завершить");
+    # - в обычном режиме показываем список для одного блюда сразу;
+    # - вместо этого спрашиваем: добавить ещё одно блюдо или завершить.
     recipe_name = data.get("quiz_recipe_name", "выбранного блюда")
-    if shopping_list:
-        shopping_lines: list[str] = []
-        for item in shopping_list:
-            item_name = item.strip()
-            if not item_name:
-                continue
-
-            search_link = build_pyaterochka_search_url(item_name)
-            shopping_lines.append(f"• {item_name} — {search_link}")
-
-        if not shopping_lines:
-            shopping_lines.append("• Не удалось собрать список ссылок для покупок.")
-
-        shopping_text = "\n".join(shopping_lines)
-        result_text = (
-            f"Готово! ✅\n"
-            f"Для блюда «{recipe_name}» нужно купить:\n"
-            f"{shopping_text}"
-        )
-    else:
-        result_text = (
-            f"Отлично! 🎉\n"
-            f"Для блюда «{recipe_name}» у вас уже есть все ингредиенты."
-        )
-
-    # Логика накопления покупок:
-    # - первый завершенный квиз: сохраняем недостающие продукты, но не задаём вопрос про продолжение
-    #   (только как раньше показываем кнопку "🔁 Новое блюдо");
-    # - далее, если режим накопления включён: добавляем продукты и показываем вопрос
-    #   "✅ Это блюдо добавлено. Хотите добавить ещё одно блюдо?" с двумя кнопками.
     accumulation_started = bool(data.get("accumulation_started", False))
 
-    if not accumulation_started:
-        dish_missing = list(shopping_list)
-        await state.update_data(
-            accumulated_missing=dish_missing,
-            accumulation_started=False,
-        )
-        await state.set_state(QuizStates.awaiting_enable_addition)
-
-        try:
-            await callback.message.edit_text(result_text, reply_markup=new_dish_keyboard())
-        except TelegramBadRequest:
-            await callback.message.answer(result_text, reply_markup=new_dish_keyboard())
-        return
-
-    # Если накопление включено — объединяем список и спрашиваем о продолжении.
     accumulated_missing = data.get("accumulated_missing", [])
     if not isinstance(accumulated_missing, list):
         accumulated_missing = list(accumulated_missing) if accumulated_missing else []
+
     accumulated_missing.extend(shopping_list)
 
-    await state.update_data(accumulated_missing=accumulated_missing)
+    await state.update_data(
+        accumulated_missing=accumulated_missing,
+        last_completed_recipe_name=recipe_name,
+    )
     await state.set_state(QuizStates.awaiting_addition_choice)
 
-    # Сначала показываем результат по текущему блюду (как было),
-    # затем отдельным сообщением задаём вопрос о добавлении следующих блюд.
-    try:
-        await callback.message.edit_text(result_text)
-    except TelegramBadRequest:
-        await callback.message.answer(result_text)
+    prompt_text = "Блюдо добавлено! Хотите добавить ещё одно блюдо или завершить?"
 
-    await callback.message.answer(
-        "✅ Это блюдо добавлено. Хотите добавить ещё одно блюдо?",
-        reply_markup=addition_prompt_keyboard(),
-    )
+    if not accumulation_started:
+        # Обычный режим: сразу показываем список покупок для текущего блюда.
+        if shopping_list:
+            dish_list_text = render_shopping_list(shopping_list)
+            result_text = f"Для блюда «{recipe_name}» нужно купить:\n{dish_list_text}"
+        else:
+            result_text = f"Для блюда «{recipe_name}» у вас уже есть все ингредиенты ✅"
 
+        try:
+            await callback.message.edit_text(result_text)
+        except TelegramBadRequest:
+            await callback.message.answer(result_text)
 
-@router.callback_query(F.data == "new_dish")
-async def start_new_dish(callback: CallbackQuery, state: FSMContext) -> None:
-    """
-    Кнопка "Новое блюдо":
-    1) Если пользователь только что завершил первый квиз и режим накопления ещё не включён,
-       то включаем накопление и просим ввести название следующего блюда.
-    2) Иначе — как раньше очищаем состояние и просим название блюда.
-    """
-    await callback.answer()
-    current_state = await state.get_state()
-
-    # Режим накопления ещё не включён: первый квиз уже сохранил accumulated_missing,
-    # пользователь нажал "Новое блюдо" — значит добавляем ещё одно блюдо.
-    if current_state == QuizStates.awaiting_enable_addition.state:
-        await state.update_data(accumulation_started=True)
-        await state.set_state(QuizStates.awaiting_next_dish_name)
         if callback.message:
-            await callback.message.answer("Напишите название следующего блюда")
+            await callback.message.answer(prompt_text, reply_markup=addition_prompt_keyboard())
         return
 
-    # Обычное поведение: старт нового одиночного квиза.
-    await state.clear()
-    if callback.message:
-        await callback.message.answer("Напишите название блюда, которое хотите проверить 🍲")
+    # Режим накопления: не показываем список, только предлагаем продолжить/завершить.
+    try:
+        await callback.message.edit_text(prompt_text, reply_markup=addition_prompt_keyboard())
+    except TelegramBadRequest:
+        await callback.message.answer(prompt_text, reply_markup=addition_prompt_keyboard())
 
 
 @router.callback_query(F.data == "multi:add_more")
 async def multi_add_more(callback: CallbackQuery, state: FSMContext) -> None:
-    """Выбор «➕ Добавить ещё блюдо» в режиме накопления."""
+    """Выбор «➕ Добавить ещё блюдо»: включаем режим накопления и ждём следующее блюдо."""
     current_state = await state.get_state()
     if current_state != QuizStates.awaiting_addition_choice.state:
         await callback.answer("Сейчас нельзя добавить ещё блюдо.", show_alert=False)
         return
 
     await callback.answer()
+    await state.update_data(accumulation_started=True)
     await state.set_state(QuizStates.awaiting_next_dish_name)
     if callback.message:
         await callback.message.answer("Напишите название следующего блюда")
@@ -617,7 +593,7 @@ async def multi_add_more(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "multi:finish")
 async def multi_finish(callback: CallbackQuery, state: FSMContext) -> None:
-    """Выбор «📦 Завершить и получить общий список» в режиме накопления."""
+    """Выбор «🏁 Завершить»: выводим список покупок и очищаем состояние."""
     current_state = await state.get_state()
     if current_state != QuizStates.awaiting_addition_choice.state:
         await callback.answer("Сейчас нельзя завершить.", show_alert=False)
@@ -628,17 +604,23 @@ async def multi_finish(callback: CallbackQuery, state: FSMContext) -> None:
     if not isinstance(accumulated_missing, list):
         accumulated_missing = list(accumulated_missing) if accumulated_missing else []
 
-    unique_products = unique_sorted_casefold(accumulated_missing)
+    accumulation_started = bool(data.get("accumulation_started", False))
+    last_recipe_name = str(data.get("last_completed_recipe_name") or "выбранного блюда")
 
-    if unique_products:
-        shopping_lines = [
-            f"• {product} — {build_pyaterochka_search_url(product)}"
-            for product in unique_products
-        ]
-        final_list_text = "\n".join(shopping_lines)
-        result_text = f"📦 Общий список покупок:\n{final_list_text}"
+    shopping_text = render_shopping_list(accumulated_missing)
+
+    if accumulation_started:
+        if unique_sorted_casefold(accumulated_missing):
+            result_text = f"📦 Общий список покупок:\n{shopping_text}"
+        else:
+            result_text = "📦 Общий список покупок пуст — у вас всё уже есть ✅"
     else:
-        result_text = "📦 Общий список покупок пуст — у вас всё уже есть ✅"
+        # Обычный режим: пользователь не выбирал «Добавить ещё»,
+        # поэтому показываем список покупок только для одного блюда.
+        if unique_sorted_casefold(accumulated_missing):
+            result_text = f"Для блюда «{last_recipe_name}» нужно купить:\n{shopping_text}"
+        else:
+            result_text = f"Для блюда «{last_recipe_name}» у вас уже есть все ингредиенты ✅"
 
     await callback.answer()
     await state.clear()
