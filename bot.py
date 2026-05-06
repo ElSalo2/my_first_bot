@@ -12,21 +12,25 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from food_emojis import emoji_for_dish, emoji_for_ingredient
 from ingredient_synonyms import (
     canonical_ingredient_display,
+    exclude_home_pantry_ingredients,
+    is_always_home_pantry_ingredient,
     ingredient_merge_key,
     shopping_lines_from_buckets,
 )
+from recipe_normalize import normalize_recipe_name, recipe_search_key
 
-# `transliterate` используется только для авто-преобразования латиницы в кириллицу.
-# Если библиотека не установлена — бот продолжит работать, просто вернув исходную строку.
-try:
-    from transliterate import translit
-except ImportError:  # pragma: no cover
-    translit = None
+# Транслитерация для названий блюд подключена в recipe_normalize.py (опционально transliterate).
+
+_MSG_ONLY_HOME_PANTRY_INGREDIENTS = (
+    "В этом рецепте только базовые позиции: вода, соль, перец для приправы и лавровый лист — "
+    "считаем, что они есть дома и не включаем их в список покупок."
+)
 
 # Токен бота нельзя хранить в репозитории. Берём из переменной окружения.
 # Пример: setx TELEGRAM_BOT_TOKEN "123:ABC"  (Windows)
@@ -55,20 +59,92 @@ def _load_token_from_dotenv(path: str = ".env") -> str | None:
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or _load_token_from_dotenv()
 
-START_HELP_TEXT = (
-    "Привет! 👋 Я помогу проверить ингредиенты для блюда.\n\n"
-    "Что умею:\n"
-    "• /recipes — показать список блюд 📋\n"
-    "• /add_recipe — добавить новое блюдо (только админ) 🧑‍🍳\n"
-    "• /cancel — выйти из текущего диалога ❌\n\n"
-    "Просто напиши название блюда, и я запущу мини-квиз по ингредиентам 😉"
-)
+START_HELP_TEXT = "Привет, что готовим? Напиши название блюда, а я подберу рецепт"
+
+ASK_DISH_NAME_TEXT = "Напишите название блюда, которое будем готовить."
+
+_SIM_WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+_CY_SOFT_SIGN_RE = re.compile(r"[ьъ]")
 
 # Telegram ID администратора: только он может добавлять блюда.
 ADMIN_ID = 69026978
 
 # Путь к SQLite-базе данных.
 DB_PATH = "recipes.db"
+# Сколько названий показывать в /recipes (лимит Telegram ~4096 символов на сообщение).
+RECIPES_LIST_LIMIT = 100
+
+
+def _migrate_recipe_name_search(conn: sqlite3.Connection) -> None:
+    """Колонка и индекс для O(1) поиска по нормализованному имени блюда."""
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(recipes)")
+    cols = [row[1] for row in cur.fetchall()]
+    if "name_search" not in cols:
+        cur.execute("ALTER TABLE recipes ADD COLUMN name_search TEXT")
+        conn.commit()
+
+    cur.execute(
+        """
+        SELECT id, name FROM recipes
+        WHERE name_search IS NULL OR TRIM(COALESCE(name_search, '')) = ''
+        """
+    )
+    pending = cur.fetchall()
+    if pending:
+        for rid, name in pending:
+            cur.execute(
+                "UPDATE recipes SET name_search = ? WHERE id = ?",
+                (recipe_search_key(str(name)), int(rid)),
+            )
+        conn.commit()
+
+    cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_recipes_name_search'"
+    )
+    if cur.fetchone() is not None:
+        return
+
+    cur.execute(
+        """
+        SELECT 1 FROM (
+            SELECT name_search FROM recipes
+            WHERE name_search IS NOT NULL AND TRIM(name_search) != ''
+            GROUP BY name_search
+            HAVING COUNT(*) > 1
+        ) LIMIT 1
+        """
+    )
+    has_dup = cur.fetchone() is not None
+    try:
+        if has_dup:
+            logging.warning(
+                "В recipes есть разные блюда с одинаковым name_search — индекс не UNIQUE."
+            )
+            cur.execute(
+                "CREATE INDEX idx_recipes_name_search ON recipes(name_search)"
+            )
+        else:
+            cur.execute(
+                "CREATE UNIQUE INDEX idx_recipes_name_search ON recipes(name_search)"
+            )
+    except sqlite3.OperationalError as e:
+        logging.warning("Индекс name_search: %s — создаётся обычный INDEX.", e)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recipes_name_search ON recipes(name_search)"
+        )
+    conn.commit()
+
+
+def _migrate_recipe_source_url(conn: sqlite3.Connection) -> None:
+    """Опциональная ссылка на страницу рецепта (из импорта HF или вручную)."""
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(recipes)")
+    cols = [row[1] for row in cur.fetchall()]
+    if "source_url" not in cols:
+        cur.execute("ALTER TABLE recipes ADD COLUMN source_url TEXT")
+        conn.commit()
+
 
 # Отдельный роутер помогает держать обработчики в одном месте.
 router = Router()
@@ -81,60 +157,6 @@ def _quiz_edit_lock_for_chat(chat_id: int) -> asyncio.Lock:
     if chat_id not in _quiz_edit_locks:
         _quiz_edit_locks[chat_id] = asyncio.Lock()
     return _quiz_edit_locks[chat_id]
-
-
-# Регулярка для проверки "только латинские буквы".
-_LATIN_ONLY_RE = re.compile(r"^[A-Za-z]+$")
-# Регулярка для проверки "содержит кириллицу".
-_CYRILLIC_RE = re.compile(r"[а-яё]", re.IGNORECASE)
-
-
-def normalize_recipe_name(name: str) -> str:
-    """
-    Нормализует название блюда:
-    - приводит к нижнему регистру;
-    - если строка состоит ТОЛЬКО из латинских букв, транслитерирует в кириллицу
-      (например: "borsh" -> "борщ");
-    - при отсутствии библиотеки `transliterate` просто возвращает строку в нижнем регистре.
-    """
-    normalized = (name or "").strip().lower()
-    if not normalized:
-        return ""
-
-    if translit is None:
-        return normalized
-
-    if normalized.isascii() and _LATIN_ONLY_RE.fullmatch(normalized):
-        # Важно: у разных версий/настроек `transliterate` флаг `reversed`
-        # может означать обратное направление. Поэтому пробуем оба направления
-        # и выбираем тот результат, который действительно содержит кириллицу.
-        candidates: list[str] = []
-        try:
-            candidates.append(translit(normalized, "ru", reversed=True).strip())
-        except Exception:
-            logging.exception("Ошибка транслитерации (reversed=True): %r", name)
-        try:
-            candidates.append(translit(normalized, "ru", reversed=False).strip())
-        except Exception:
-            logging.exception("Ошибка транслитерации (reversed=False): %r", name)
-
-        for candidate in candidates:
-            if _CYRILLIC_RE.search(candidate):
-                candidate = candidate.lower()
-
-                # Эвристика для частого сценария "borsh/borch" -> "борщ".
-                # В некоторых сборках `transliterate` "sh/ch" транслитерируются как
-                # "ш/ч" вместо "щ". Мы исправляем только самый конец слова.
-                if normalized.endswith(("sh", "ch")) and candidate.endswith(("ш", "ч")):
-                    candidate = candidate[:-1] + "щ"
-
-                return candidate
-
-        # Если оба варианта не дали кириллицу — возвращаем нормализованную строку.
-        # (Например, если строка не поддерживается маппингом.)
-        return normalized
-
-    return normalized
 
 
 def format_dish_title(name: str) -> str:
@@ -188,12 +210,16 @@ class QuizStates(StatesGroup):
     awaiting_manual_product = State()  # ждём текст: продукты в список вручную
 
 
+class RecipeBrowseStates(StatesGroup):
+    """Просмотр карточки рецепта перед запуском квиза."""
+
+    viewing_offer = State()
+
+
 def init_db() -> None:
     """
-    Создаем таблицы при старте бота, если их еще нет.
-    Структура полностью соответствует заданию:
-      - recipes (id INTEGER PRIMARY KEY, name TEXT UNIQUE)
-      - ingredients (id INTEGER PRIMARY KEY, recipe_id INTEGER, name TEXT)
+    Создаём таблицы при старте бота.
+    Дополнительно: колонка recipes.name_search и индекс для быстрого поиска по имени.
     """
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
@@ -216,18 +242,31 @@ def init_db() -> None:
             """
         )
         conn.commit()
+        _migrate_recipe_name_search(conn)
+        _migrate_recipe_source_url(conn)
 
 
-def get_all_recipes() -> list[str]:
-    """Возвращает список названий всех блюд, отсортированный по алфавиту."""
+def get_recipes_list_preview(limit: int = RECIPES_LIST_LIMIT) -> tuple[list[str], int]:
+    """Первые `limit` названий (по имени) и общее число блюд — для /recipes без полного скана в память."""
+    cap = max(1, min(limit, 500))
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT name FROM recipes ORDER BY name COLLATE NOCASE")
-        rows = cursor.fetchall()
-    return [row[0] for row in rows]
+        cursor.execute("SELECT COUNT(*) FROM recipes")
+        total = int(cursor.fetchone()[0])
+        cursor.execute(
+            "SELECT name FROM recipes ORDER BY name COLLATE NOCASE LIMIT ?",
+            (cap,),
+        )
+        names = [str(row[0]) for row in cursor.fetchall()]
+    return names, total
 
 
-def add_recipe_to_db(recipe_name: str, ingredients: list[str]) -> bool:
+def add_recipe_to_db(
+    recipe_name: str,
+    ingredients: list[str],
+    *,
+    source_url: str | None = None,
+) -> bool:
     """
     Добавляет рецепт и его ингредиенты в БД.
     Возвращает:
@@ -237,7 +276,14 @@ def add_recipe_to_db(recipe_name: str, ingredients: list[str]) -> bool:
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute("INSERT INTO recipes (name) VALUES (?)", (recipe_name,))
+            cursor.execute(
+                "INSERT INTO recipes (name, name_search, source_url) VALUES (?, ?, ?)",
+                (
+                    recipe_name,
+                    recipe_search_key(recipe_name),
+                    (source_url.strip() if isinstance(source_url, str) and source_url.strip() else None),
+                ),
+            )
             recipe_id = cursor.lastrowid
 
             cursor.executemany(
@@ -250,58 +296,378 @@ def add_recipe_to_db(recipe_name: str, ingredients: list[str]) -> bool:
         return False
 
 
-def find_recipe_with_ingredients(recipe_name: str) -> tuple[int, str, list[str]] | None:
-    """
-    Ищет блюдо по названию без учета регистра.
-    Возвращает кортеж (recipe_id, exact_recipe_name, ingredients) либо None.
-    """
-    # Важно: SQLite `LOWER()` и `COLLATE NOCASE` по умолчанию могут
-    # корректно работать только с ASCII. Поэтому делаем сравнение в Python
-    # через `.casefold()` — это надежнее для Unicode (кириллицы).
-    target = normalize_recipe_name(recipe_name).casefold()
+def sql_like_escape(fragment: str) -> str:
+    return fragment.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
+
+def collect_search_keys(normalized_name: str) -> list[str]:
+    """
+    Несколько ключей для LIKE по name_search: базовый + упрощение укр./рус.
+    (ь/ъ, і→и, ї→и, …) чтобы находились «український» vs «украинский» и т.п.
+    """
+    nm = normalize_recipe_name(normalized_name).strip()
+    nm = " ".join(nm.split())
+    if not nm:
+        return []
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    def push(fragment: str) -> None:
+        k = recipe_search_key(fragment)
+        if len(k) < 2 or k in seen:
+            return
+        seen.add(k)
+        keys.append(k)
+
+    push(nm)
+    cf = nm.casefold()
+    push(_CY_SOFT_SIGN_RE.sub("", cf))
+    _uk_ru = str.maketrans({"і": "и", "ї": "и", "є": "е", "ґ": "г"})
+    push(cf.translate(_uk_ru))
+    push(_CY_SOFT_SIGN_RE.sub("", cf.translate(_uk_ru)))
+    return keys
+
+
+def similarity_tokens(query_key: str) -> list[str]:
+    """Токены для подбора похожих рецептов (длинные — раньше) + укр./рус. варианты слов."""
+    query_key_cf = (query_key or "").strip().casefold()
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(s: str) -> None:
+        if len(s) < 3 or s in seen:
+            return
+        seen.add(s)
+        out.append(s)
+
+    for sk in collect_search_keys(query_key_cf):
+        add(sk)
+
+    words = _SIM_WORD_RE.findall(query_key_cf)
+    for w in sorted(words, key=len, reverse=True):
+        cf = w.casefold()
+        add(cf)
+        for sk in collect_search_keys(cf):
+            add(sk)
+    return out
+
+
+def search_recipe_ids_substring(normalized_query: str) -> list[int]:
+    """Рецепты, где name_search содержит запрос (или его укр./рус. вариант) как подстроку."""
+    ordered: list[int] = []
+    seen: set[int] = set()
     with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, name FROM recipes")
-        recipes_rows = cursor.fetchall()
+        cur = conn.cursor()
+        for key in collect_search_keys(normalized_query):
+            pat = f"%{sql_like_escape(key)}%"
+            cur.execute(
+                "SELECT id FROM recipes WHERE name_search LIKE ? ESCAPE '\\' ORDER BY id",
+                (pat,),
+            )
+            for (rid,) in cur.fetchall():
+                rid = int(rid)
+                if rid not in seen:
+                    seen.add(rid)
+                    ordered.append(rid)
+    return ordered
 
-        recipe_id: int | None = None
-        exact_name: str | None = None
-        for rid, name in recipes_rows:
-            if str(name).casefold() == target:
-                recipe_id = int(rid)
-                exact_name = str(name)
+
+def search_recipe_ids_all_significant_words(normalized_query: str) -> list[int]:
+    """
+    Все значимые слова запроса (≥3 символа) должны встречаться в названии
+    (каждое — как подстрока, с вариантами collect_search_keys).
+    """
+    nm = normalize_recipe_name(normalized_query).strip()
+    nm = " ".join(nm.split())
+    words = [w.casefold() for w in _SIM_WORD_RE.findall(nm) if len(w.casefold()) >= 3]
+    if len(words) < 2:
+        return []
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        conj_parts: list[str] = []
+        params: list[str] = []
+        for w in words:
+            variants = collect_search_keys(w)
+            if not variants:
+                return []
+            or_parts = ["name_search LIKE ? ESCAPE '\\'" for _ in variants]
+            conj_parts.append("(" + " OR ".join(or_parts) + ")")
+            for vk in variants:
+                params.append(f"%{sql_like_escape(vk)}%")
+        sql = "SELECT id FROM recipes WHERE " + " AND ".join(conj_parts) + " ORDER BY id"
+        cur.execute(sql, params)
+        return [int(r[0]) for r in cur.fetchall()]
+
+
+def fetch_similar_recipe_ids(query_key: str, exclude: set[int], limit: int = 40) -> list[int]:
+    ban = set(exclude)
+    out: list[int] = []
+    tokens = similarity_tokens(query_key)
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        for tok in tokens:
+            need = limit - len(out)
+            if need <= 0:
                 break
+            pat = f"%{sql_like_escape(tok)}%"
+            if ban:
+                qs = ",".join("?" * len(ban))
+                sql = (
+                    f"SELECT id FROM recipes WHERE name_search LIKE ? ESCAPE '\\' "
+                    f"AND id NOT IN ({qs}) ORDER BY id LIMIT ?"
+                )
+                cur.execute(sql, (pat, *ban, need))
+            else:
+                cur.execute(
+                    "SELECT id FROM recipes WHERE name_search LIKE ? ESCAPE '\\' ORDER BY id LIMIT ?",
+                    (pat, need),
+                )
+            for (rid,) in cur.fetchall():
+                rid = int(rid)
+                if rid in ban:
+                    continue
+                out.append(rid)
+                ban.add(rid)
+                if len(out) >= limit:
+                    return out
+    return out
 
-        if recipe_id is None or exact_name is None:
-            return None
 
-        cursor.execute(
-            "SELECT name FROM ingredients WHERE recipe_id = ? ORDER BY id",
-            (recipe_id,),
+def filter_recipe_ids_with_ingredients(ids: list[int]) -> list[int]:
+    """Оставляет только те id, для которых в БД есть хотя бы одна строка ингредиентов."""
+    if not ids:
+        return []
+    uniq = list(dict.fromkeys(int(i) for i in ids))
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        qs = ",".join("?" * len(uniq))
+        cur.execute(
+            f"SELECT DISTINCT recipe_id FROM ingredients WHERE recipe_id IN ({qs})",
+            uniq,
         )
-        ingredients_rows = cursor.fetchall()
+        have = {int(r[0]) for r in cur.fetchall()}
+    return [i for i in uniq if i in have]
 
-    ingredients = [row[0] for row in ingredients_rows]
-    return recipe_id, exact_name, ingredients
+
+def resolve_recipe_external_url(source_url: str | None) -> str | None:
+    """
+    Только прямая ссылка на страницу рецепта, как в датасете HF (поле url).
+    Fallback-поиск по имени на povarenok.ru с кириллицей в query давал 404 и кракозябры.
+    """
+    if not isinstance(source_url, str):
+        return None
+    u = source_url.strip()
+    if u.startswith(("http://", "https://")):
+        return u
+    return None
+
+
+def format_recipe_offer_html(
+    recipe_name: str, ingredients: list[str], link: str | None
+) -> str:
+    lines: list[str] = []
+    cap = 100
+    for ing in ingredients[:cap]:
+        lines.append(f"• {html.escape(format_ingredient_display(str(ing)))}")
+    if len(ingredients) > cap:
+        lines.append("• …")
+    ing_block = "\n".join(lines) if lines else "• (нет списка)"
+    title = html.escape(format_dish_title(recipe_name))
+    if link:
+        safe_link = html.escape(link, quote=True)
+        link_block = (
+            f"<a href=\"{safe_link}\">Открыть полный рецепт на сайте</a>\n\n"
+            f"<i>Пошаговое приготовление — на странице по ссылке.</i>"
+        )
+    else:
+        link_block = (
+            "<i>Для этого блюда нет сохранённой ссылки на Поварёнок "
+            "(рецепт добавлен вручную или название не совпало с датасетом).</i>"
+        )
+    return (
+        f"<b>{title}</b>\n\n"
+        f"<b>Ингредиенты:</b>\n{ing_block}\n\n"
+        f"{link_block}"
+    )
+
+
+def recipe_offer_keyboard(recipe_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👍 Делаем", callback_data=f"recipe:do:{recipe_id}"),
+                InlineKeyboardButton(
+                    text="🔎 Найти другой рецепт",
+                    callback_data="recipe:next",
+                ),
+            ],
+            [
+                InlineKeyboardButton(text="👎 Не делаем", callback_data="recipe:cancel"),
+            ],
+        ]
+    )
+
+
+def load_recipe_row(recipe_id: int) -> tuple[int, str, list[str], str | None] | None:
+    rid = int(recipe_id)
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT name, source_url FROM recipes WHERE id = ?", (rid,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        name = str(row[0])
+        raw_url = row[1]
+        url = str(raw_url).strip() if raw_url else None
+        cur.execute(
+            "SELECT name FROM ingredients WHERE recipe_id = ? ORDER BY id",
+            (rid,),
+        )
+        ing_rows = cur.fetchall()
+    ingredients = [str(r[0]) for r in ing_rows]
+    return rid, name, ingredients, url
 
 
 def find_recipe_by_id(recipe_id: int) -> tuple[int, str, list[str]] | None:
     """Блюдо по id из БД: (id, точное имя, ингредиенты)."""
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM recipes WHERE id = ?", (int(recipe_id),))
-        row = cursor.fetchone()
-        if not row:
-            return None
-        exact_name = str(row[0])
-        cursor.execute(
-            "SELECT name FROM ingredients WHERE recipe_id = ? ORDER BY id",
-            (int(recipe_id),),
+    row = load_recipe_row(recipe_id)
+    if row is None:
+        return None
+    rid, name, ingredients, _url = row
+    return rid, name, ingredients
+
+
+async def append_similar_to_browse(state: FSMContext) -> bool:
+    data = await state.get_data()
+    ids = list(data.get("browse_offer_ids") or [])
+    qkey = str(data.get("browse_query_key") or "")
+    batch = fetch_similar_recipe_ids(qkey, set(ids), limit=80)
+    batch = filter_recipe_ids_with_ingredients(batch)
+    if not batch:
+        return False
+    ids.extend(batch)
+    await state.update_data(browse_offer_ids=ids)
+    return True
+
+
+async def recipe_browse_advance(state: FSMContext) -> tuple[bool, int | None]:
+    data = await state.get_data()
+    ids = list(data.get("browse_offer_ids") or [])
+    pos = int(data.get("browse_offer_pos", 0)) + 1
+
+    while pos >= len(ids):
+        if not await append_similar_to_browse(state):
+            prev = max(0, len(ids) - 1)
+            await state.update_data(browse_offer_pos=prev)
+            return False, None
+        data = await state.get_data()
+        ids = list(data.get("browse_offer_ids") or [])
+
+    rid = ids[pos]
+    await state.update_data(browse_offer_pos=pos, browse_current_recipe_id=rid)
+    return True, rid
+
+
+async def send_recipe_offer_card(
+    message: Message,
+    state: FSMContext,
+    recipe_id: int,
+    *,
+    edit_target: Message | None = None,
+) -> None:
+    row = load_recipe_row(recipe_id)
+    if row is None:
+        return
+    _rid, name, ingredients, src_url = row
+    if not ingredients:
+        txt = f"Для блюда {format_dish_title(name)} пока нет ингредиентов в базе."
+        if edit_target:
+            await edit_target.edit_text(txt)
+        else:
+            await message.answer(txt)
+        return
+    link = resolve_recipe_external_url(src_url)
+    html_body = format_recipe_offer_html(name, ingredients, link)
+    kb = recipe_offer_keyboard(recipe_id)
+    await state.update_data(browse_current_recipe_id=recipe_id)
+    if edit_target:
+        await edit_target.edit_text(
+            html_body,
+            reply_markup=kb,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
-        ing_rows = cursor.fetchall()
-    ingredients = [r[0] for r in ing_rows]
-    return int(recipe_id), exact_name, ingredients
+    else:
+        await message.answer(
+            html_body,
+            reply_markup=kb,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+
+async def start_ingredient_quiz_for_message(message: Message, state: FSMContext, recipe_id: int) -> None:
+    row = load_recipe_row(recipe_id)
+    if row is None:
+        await message.answer("Рецепт не найден в базе.")
+        return
+    rid, recipe_name, ingredients, _url = row
+    if not ingredients:
+        await message.answer(
+            f"Для блюда {format_dish_title(recipe_name)} пока нет ингредиентов в базе."
+        )
+        return
+    ingredients_quiz = exclude_home_pantry_ingredients(ingredients)
+    prev_data = await state.get_data()
+    extras_keep = _dedupe_extras_preserve_order(
+        _coerce_extras_list(prev_data.get("shopping_list_extras"))
+    )
+    if not ingredients_quiz:
+        await state.update_data(
+            browse_offer_ids=None,
+            browse_offer_pos=None,
+            browse_current_recipe_id=None,
+            browse_query_key=None,
+            quiz_recipe_id=rid,
+            quiz_recipe_name=recipe_name,
+            quiz_ingredients=[],
+            quiz_index=0,
+            shopping_list=[],
+            editing_last=False,
+            shopping_list_extras=extras_keep,
+        )
+        await _finalize_ingredient_quiz_flow(
+            message.bot,
+            state,
+            message,
+            quiz_surface_message=None,
+            recipe_id=rid,
+            recipe_name=str(recipe_name),
+            shopping_list_buy=[],
+            preamble=_MSG_ONLY_HOME_PANTRY_INGREDIENTS,
+        )
+        return
+
+    await state.update_data(
+        browse_offer_ids=None,
+        browse_offer_pos=None,
+        browse_current_recipe_id=None,
+        browse_query_key=None,
+        quiz_recipe_id=rid,
+        quiz_recipe_name=recipe_name,
+        quiz_ingredients=ingredients_quiz,
+        quiz_index=0,
+        shopping_list=[],
+        editing_last=False,
+        shopping_list_extras=extras_keep,
+    )
+    await state.set_state(QuizStates.in_progress)
+    first_ingredient = ingredients_quiz[0]
+    await message.answer(
+        f"Проверим, всё ли у тебя есть для того, чтобы приготовить {format_dish_title(recipe_name)}\n"
+        f"У тебя есть {format_ingredient_display(first_ingredient)}?",
+        reply_markup=ingredient_quiz_keyboard(rid, 0),
+    )
 
 
 def ingredient_quiz_keyboard(recipe_id: int, ingredient_index: int) -> InlineKeyboardMarkup:
@@ -378,6 +744,86 @@ def quiz_finished_recheck_keyboard(recipe_id: int) -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+async def _finalize_ingredient_quiz_flow(
+    bot: Bot,
+    state: FSMContext,
+    anchor_chat_message: Message,
+    *,
+    quiz_surface_message: Message | None,
+    recipe_id: int,
+    recipe_name: str,
+    shopping_list_buy: list,
+    preamble: str | None = None,
+) -> None:
+    """
+    Общий хвост после последнего шага квиза: закрывающее сообщение, корзины, переход и клавиатура.
+    Если нечего было спрашивать (только базовый набор) — передай preamble и quiz_surface_message=None.
+    """
+    data = await state.get_data()
+
+    buckets = data.get("accumulated_buckets", [])
+    if not isinstance(buckets, list):
+        buckets = []
+
+    final_list_shown = bool(data.get("final_list_shown", False))
+    was_editing = bool(data.get("editing_last", False))
+
+    dish_missing = exclude_home_pantry_ingredients(
+        [str(x).strip() for x in (shopping_list_buy or []) if str(x).strip()]
+    )
+
+    buckets = _upsert_bucket(buckets, recipe=str(recipe_name), missing=dish_missing)
+
+    extras_keep = _dedupe_extras_preserve_order(_coerce_extras_list(data.get("shopping_list_extras")))
+
+    closing_text = (
+        "Сохранил ингредиенты в список покупок. "
+        "Добавим новое блюдо или посмотрим список?"
+    )
+    kb_finish = quiz_finished_recheck_keyboard(recipe_id) if recipe_id > 0 else None
+
+    if preamble:
+        await anchor_chat_message.answer(preamble)
+
+    if quiz_surface_message is not None:
+        try:
+            await quiz_surface_message.edit_text(closing_text, reply_markup=kb_finish)
+        except TelegramBadRequest:
+            await quiz_surface_message.answer(closing_text, reply_markup=kb_finish)
+    else:
+        await anchor_chat_message.answer(closing_text, reply_markup=kb_finish)
+
+    await state.update_data(
+        accumulated_buckets=buckets,
+        last_recipe_name=str(recipe_name),
+        editing_last=False,
+        shopping_list_extras=extras_keep,
+    )
+
+    await state.set_state(QuizStates.awaiting_addition_choice)
+    keyboard_text = (
+        f"✅ Блюдо {format_dish_title(recipe_name)} обновлено! Что дальше?"
+        if was_editing
+        else f"✅ Блюдо {format_dish_title(recipe_name)} добавлено! Что дальше?"
+    )
+
+    resend_shop_here = quiz_surface_message or anchor_chat_message
+    if final_list_shown and was_editing:
+        shop_body = render_shopping_list_html_from_buckets(buckets, extras_keep)
+        if shop_body:
+            await resend_shop_here.answer(
+                f"📦 Общий список покупок:\n{shop_body}",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        else:
+            await resend_shop_here.answer(
+                "📦 Общий список покупок пуст — у вас всё уже есть ✅"
+            )
+
+    await _send_keyboard_message(anchor_chat_message, state, keyboard_text)
 
 
 def render_shopping_list_html_from_buckets(
@@ -466,18 +912,24 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 @router.message(Command("recipes"))
 async def cmd_recipes(message: Message) -> None:
-    """Показывает все доступные блюда из базы."""
-    recipes = get_all_recipes()
-    if not recipes:
+    """Показывает доступные блюда из базы (первые N и общее число)."""
+    recipes, total = get_recipes_list_preview()
+    if not recipes or total == 0:
         await message.answer(
             "Пока нет ни одного блюда 😕\n"
             "Администратор может добавить первое через /add_recipe."
         )
         return
 
-    # Показываем названия с большой буквы (как требовалось).
     lines = [f"• {emoji_for_dish(name)} {name.capitalize()}" for name in recipes]
-    await message.answer("Доступные блюда 🍽️:\n" + "\n".join(lines))
+    body = "Доступные блюда 🍽️:\n" + "\n".join(lines)
+    if total > len(recipes):
+        body += (
+            f"\n\n… и ещё {total - len(recipes)} в базе "
+            f"(показаны первые {len(recipes)} по алфавиту). "
+            "Уточните название или напишите его для поиска рецепта."
+        )
+    await message.answer(body)
 
 
 @router.message(Command("add_recipe"))
@@ -566,6 +1018,26 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
         await message.answer("Добавление продуктов отменено.")
         return
 
+    if current_state == RecipeBrowseStates.viewing_offer.state:
+        await _clear_last_keyboard(message.bot, state)
+        snap = await state.get_data()
+        buckets_raw = snap.get("accumulated_buckets")
+        buckets_copy = copy.deepcopy(buckets_raw) if isinstance(buckets_raw, list) else []
+        extras_copy = _dedupe_extras_preserve_order(_coerce_extras_list(snap.get("shopping_list_extras")))
+        lr = snap.get("last_recipe_name")
+        ff = bool(snap.get("final_list_shown", False))
+        acc = bool(snap.get("accumulation_started", False))
+        await state.clear()
+        await state.update_data(
+            accumulated_buckets=buckets_copy,
+            shopping_list_extras=extras_copy,
+            last_recipe_name=lr,
+            final_list_shown=ff,
+            accumulation_started=acc,
+        )
+        await message.answer(f"Отменено ✅\n{ASK_DISH_NAME_TEXT}")
+        return
+
     await _clear_last_keyboard(message.bot, state)
     await state.clear()
     await message.answer("Диалог отменен ✅ Можете выбрать другое блюдо.")
@@ -597,8 +1069,9 @@ async def handle_manual_shopping_items(message: Message, state: FSMContext) -> N
             mk = ingredient_merge_key(str(m))
             if mk:
                 keys_seen.add(mk)
-    added_labels: list[str] = []
     for part in parts:
+        if is_always_home_pantry_ingredient(part):
+            continue
         mk = ingredient_merge_key(part)
         if not mk:
             continue
@@ -607,7 +1080,6 @@ async def handle_manual_shopping_items(message: Message, state: FSMContext) -> N
         keys_seen.add(mk)
         disp = canonical_ingredient_display(part)
         extras_prev.append(disp)
-        added_labels.append(disp)
 
     extras_prev = _dedupe_extras_preserve_order(extras_prev)
 
@@ -620,42 +1092,35 @@ async def handle_manual_shopping_items(message: Message, state: FSMContext) -> N
     target_state = ret_state if ret_state else QuizStates.after_shopping_list.state
     await state.set_state(target_state)
 
-    if target_state == QuizStates.after_shopping_list.state:
-        body = render_shopping_list_html_from_buckets(buckets, extras_prev)
-        if body:
-            head = ""
-            if added_labels:
-                head = "Добавлено: " + ", ".join(added_labels) + "\n\n"
-            await message.answer(
-                head + f"📦 Общий список покупок:\n{body}",
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=shopping_list_actions_keyboard(),
-            )
-        else:
-            await message.answer(
-                "В списке пока пусто — добавьте продукты или пройдите квиз по блюду.",
-                reply_markup=shopping_list_actions_keyboard(),
-            )
+    body = render_shopping_list_html_from_buckets(buckets, extras_prev)
+    kb = (
+        shopping_list_actions_keyboard()
+        if target_state == QuizStates.after_shopping_list.state
+        else addition_prompt_keyboard()
+    )
+
+    if body:
+        await message.answer(
+            f"📦 Общий список покупок:\n{body}",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=kb,
+        )
         return
 
-    if added_labels:
-        await message.answer(
-            "Добавлено в список: " + ", ".join(added_labels),
-            reply_markup=addition_prompt_keyboard(),
-        )
-    else:
-        await message.answer(
-            "Эти позиции уже есть в списке или совпадают с тем, что из блюд.",
-            reply_markup=addition_prompt_keyboard(),
-        )
+    await message.answer(
+        "В списке пока пусто — добавьте продукты или пройдите квиз по блюду."
+        if not buckets and not extras_prev
+        else "Эти позиции уже есть в списке или совпадают с тем, что из блюд.",
+        reply_markup=kb,
+    )
 
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_recipe_search(message: Message, state: FSMContext) -> None:
     """
     Любой текст (не команда) считаем названием блюда.
-    Если блюдо найдено — запускаем квиз по ингредиентам.
+    Показываем карточку: название, ингредиенты, ссылка и кнопки Делаем / Другой / Не делаем.
     """
     user_text = (message.text or "").strip()
     if not user_text:
@@ -664,6 +1129,9 @@ async def handle_recipe_search(message: Message, state: FSMContext) -> None:
     current_state = await state.get_state()
 
     if current_state == QuizStates.awaiting_manual_product.state:
+        await message.answer(
+            "Сейчас жду продукты для списка через запятую или отправьте /cancel."
+        )
         return
 
     # После показа итогового списка можно просто написать новое блюдо — новый квиз без нажатия кнопки.
@@ -693,43 +1161,127 @@ async def handle_recipe_search(message: Message, state: FSMContext) -> None:
         await message.answer("Сначала ответьте на вопросы квиза кнопками ✅")
         return
 
-    # Нормализуем запрос пользователя перед поиском в базе:
-    # нижний регистр + транслит латиницы в кириллицу.
-    normalized_name = normalize_recipe_name(user_text)
-    found = find_recipe_with_ingredients(normalized_name)
-    if not found:
+    if current_state == RecipeBrowseStates.viewing_offer.state:
+        await state.update_data(
+            browse_offer_ids=None,
+            browse_offer_pos=None,
+            browse_current_recipe_id=None,
+            browse_query_key=None,
+        )
+        await state.set_state(None)
+
+    normalized_name = " ".join(normalize_recipe_name(user_text).split())
+    query_key = recipe_search_key(normalized_name)
+
+    primary_ids = search_recipe_ids_substring(normalized_name)
+    recipe_ids = filter_recipe_ids_with_ingredients(list(primary_ids))
+    if not recipe_ids:
+        recipe_ids = filter_recipe_ids_with_ingredients(
+            search_recipe_ids_all_significant_words(normalized_name)
+        )
+    if not recipe_ids:
+        recipe_ids = filter_recipe_ids_with_ingredients(
+            fetch_similar_recipe_ids(query_key, set(), limit=80)
+        )
+
+    if not recipe_ids:
         await message.answer(
-            "Блюдо не найдено. Попробуйте написать по-русски или проверьте список командой /recipes."
+            "Блюдо не найдено. Попробуйте другое название или команду /recipes."
         )
         return
 
-    recipe_id, recipe_name, ingredients = found
-    if not ingredients:
-        await message.answer(
-            f"Для блюда {format_dish_title(recipe_name)} пока нет ингредиентов в базе."
-        )
-        return
-
-    # Запускаем опрос ингредиентов для выбранного блюда.
-    prev_data = await state.get_data()
-    extras_keep = _dedupe_extras_preserve_order(_coerce_extras_list(prev_data.get("shopping_list_extras")))
-    await state.set_state(QuizStates.in_progress)
     await state.update_data(
-        quiz_recipe_id=recipe_id,
-        quiz_recipe_name=recipe_name,
-        quiz_ingredients=ingredients,
-        quiz_index=0,
-        shopping_list=[],
-        editing_last=False,
-        shopping_list_extras=extras_keep,
+        browse_offer_ids=recipe_ids,
+        browse_offer_pos=0,
+        browse_query_key=query_key,
+        browse_current_recipe_id=recipe_ids[0],
     )
+    await state.set_state(RecipeBrowseStates.viewing_offer)
+    await send_recipe_offer_card(message, state, recipe_ids[0], edit_target=None)
 
-    first_ingredient = ingredients[0]
-    await message.answer(
-        f"Проверим, всё ли у тебя есть для того, чтобы приготовить {format_dish_title(recipe_name)}\n"
-        f"У тебя есть {format_ingredient_display(first_ingredient)}?",
-        reply_markup=ingredient_quiz_keyboard(recipe_id, 0),
-    )
+
+@router.callback_query(F.data.startswith("recipe:"))
+async def recipe_offer_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
+    """Кнопки под карточкой рецепта до запуска квиза."""
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    current_state = await state.get_state()
+    parts = (callback.data or "").split(":")
+
+    if len(parts) < 2:
+        await callback.answer()
+        return
+
+    if parts[1] == "cancel":
+        if current_state != RecipeBrowseStates.viewing_offer.state:
+            await callback.answer("Это меню уже неактуально.", show_alert=False)
+            return
+        await callback.answer()
+        snap = await state.get_data()
+        buckets_raw = snap.get("accumulated_buckets")
+        buckets_copy = copy.deepcopy(buckets_raw) if isinstance(buckets_raw, list) else []
+        extras_copy = _dedupe_extras_preserve_order(_coerce_extras_list(snap.get("shopping_list_extras")))
+        lr = snap.get("last_recipe_name")
+        ff = bool(snap.get("final_list_shown", False))
+        acc = bool(snap.get("accumulation_started", False))
+        await state.clear()
+        await state.update_data(
+            accumulated_buckets=buckets_copy,
+            shopping_list_extras=extras_copy,
+            last_recipe_name=lr,
+            final_list_shown=ff,
+            accumulation_started=acc,
+        )
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await callback.message.answer(ASK_DISH_NAME_TEXT)
+        return
+
+    if current_state != RecipeBrowseStates.viewing_offer.state:
+        await callback.answer("Сначала найдите блюдо по названию.", show_alert=False)
+        return
+
+    if parts[1] == "next":
+        ok, rid = await recipe_browse_advance(state)
+        if not ok or rid is None:
+            await callback.answer(
+                "Больше нет других подходящих рецептов 😕",
+                show_alert=True,
+            )
+            return
+        await callback.answer()
+        await send_recipe_offer_card(
+            callback.message, state, rid, edit_target=callback.message
+        )
+        return
+
+    if parts[1] == "do":
+        if len(parts) != 3:
+            await callback.answer()
+            return
+        try:
+            rid = int(parts[2])
+        except ValueError:
+            await callback.answer()
+            return
+        data = await state.get_data()
+        expected = data.get("browse_current_recipe_id")
+        if expected is not None and int(expected) != rid:
+            await callback.answer("Устаревшая кнопка.", show_alert=False)
+            return
+        await callback.answer()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await start_ingredient_quiz_for_message(callback.message, state, rid)
+        return
+
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("quiz:"))
@@ -796,68 +1348,16 @@ async def process_quiz_answer(callback: CallbackQuery, state: FSMContext) -> Non
     recipe_name = str(data.get("quiz_recipe_name") or "блюда")
     rid = int(data.get("quiz_recipe_id") or 0)
 
-    # Заменяем текст последнего вопроса и показываем «Проверить ингредиенты» здесь же (не под списком покупок).
-    closing_text = (
-        "Сохранил ингредиенты в список покупок. "
-        "Добавим новое блюдо или посмотрим список?"
+    anchor = callback.message
+    await _finalize_ingredient_quiz_flow(
+        callback.bot,
+        state,
+        anchor,
+        quiz_surface_message=anchor,
+        recipe_id=rid,
+        recipe_name=recipe_name,
+        shopping_list_buy=shopping_list,
     )
-    kb = quiz_finished_recheck_keyboard(rid) if rid > 0 else None
-    try:
-        await callback.message.edit_text(closing_text, reply_markup=kb)
-    except TelegramBadRequest:
-        if callback.message:
-            await callback.message.answer(closing_text, reply_markup=kb)
-
-    # Квиз завершён: общий список с Магнитом после «Посмотреть список» или сразу после обновления блюда,
-    # если список уже показывали ранее (final_list_shown).
-
-    # buckets: [{"recipe": "...", "missing": ["..."]}, ...]
-    buckets = data.get("accumulated_buckets", [])
-    if not isinstance(buckets, list):
-        buckets = []
-
-    final_list_shown = bool(data.get("final_list_shown", False))
-    was_editing = bool(data.get("editing_last", False))
-
-    # missing для этого блюда (как пользователь отметил "Нужно купить")
-    dish_missing = [str(x).strip() for x in (shopping_list or []) if str(x).strip()]
-
-    buckets = _upsert_bucket(buckets, recipe=str(recipe_name), missing=dish_missing)
-
-    extras_keep = _dedupe_extras_preserve_order(_coerce_extras_list(data.get("shopping_list_extras")))
-
-    await state.update_data(
-        accumulated_buckets=buckets,
-        last_recipe_name=str(recipe_name),
-        editing_last=False,
-        shopping_list_extras=extras_keep,
-    )
-
-    await state.set_state(QuizStates.awaiting_addition_choice)
-    keyboard_text = (
-        f"✅ Блюдо {format_dish_title(recipe_name)} обновлено! Что дальше?"
-        if was_editing
-        else f"✅ Блюдо {format_dish_title(recipe_name)} добавлено! Что дальше?"
-    )
-
-    # Уже выводили общий список и пользователь заново прошёл квиз по блюду — обновляем список сразу.
-    if final_list_shown and was_editing and callback.message:
-        shop_body = render_shopping_list_html_from_buckets(buckets, extras_keep)
-        if shop_body:
-            await callback.message.answer(
-                f"📦 Общий список покупок:\n{shop_body}",
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-        else:
-            await callback.message.answer(
-                "📦 Общий список покупок пуст — у вас всё уже есть ✅"
-            )
-
-    if callback.message:
-        await _send_keyboard_message(callback.message, state, keyboard_text)
-    else:
-        await _clear_last_keyboard(callback.bot, state)
 
 
 @router.callback_query(F.data == "multi:add_product")
@@ -972,11 +1472,25 @@ async def multi_edit_dish(callback: CallbackQuery, state: FSMContext) -> None:
             shopping_list_extras=extras_keep,
         )
 
+        ingredients_quiz = exclude_home_pantry_ingredients(ingredients)
+        if not ingredients_quiz:
+            await _finalize_ingredient_quiz_flow(
+                callback.bot,
+                state,
+                callback.message,
+                quiz_surface_message=None,
+                recipe_id=recipe_id,
+                recipe_name=str(recipe_name),
+                shopping_list_buy=[],
+                preamble=_MSG_ONLY_HOME_PANTRY_INGREDIENTS,
+            )
+            return
+
         await state.set_state(QuizStates.in_progress)
         await state.update_data(
             quiz_recipe_id=recipe_id,
             quiz_recipe_name=recipe_name,
-            quiz_ingredients=ingredients,
+            quiz_ingredients=ingredients_quiz,
             quiz_index=0,
             shopping_list=[],
             shopping_list_extras=extras_keep,
@@ -984,7 +1498,7 @@ async def multi_edit_dish(callback: CallbackQuery, state: FSMContext) -> None:
 
         await callback.message.answer(
             f"Редактируем блюдо {format_dish_title(recipe_name)} ✏️\n"
-            f"У тебя есть {format_ingredient_display(ingredients[0])}?",
+            f"У тебя есть {format_ingredient_display(ingredients_quiz[0])}?",
             reply_markup=ingredient_quiz_keyboard(recipe_id, 0),
         )
 
@@ -1104,8 +1618,12 @@ async def main() -> None:
     init_db()
 
     bot = Bot(token=TOKEN)
-    dp = Dispatcher()
+    # FSM только в RAM: полный сброс состояний всех пользователей при каждом перезапуске процесса.
+    dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    logging.info(
+        "Состояния диалогов (FSM) в памяти: после перезапуска бота у всех пользователей чистый сеанс."
+    )
 
     try:
         await dp.start_polling(bot)

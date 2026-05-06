@@ -1,0 +1,2 @@
+# Зависимости только для scripts/import_povarenok.py (импорт датасета с Hugging Face)
+datasets>=3.0
